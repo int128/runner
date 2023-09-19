@@ -762,6 +762,8 @@ namespace GitHub.Runner.Worker
             ArgUtil.NotNull(downloadInfo, nameof(downloadInfo));
             ArgUtil.NotNullOrEmpty(downloadInfo.NameWithOwner, nameof(downloadInfo.NameWithOwner));
             ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.Ref));
+            ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedNameWithOwner));
+            ArgUtil.NotNullOrEmpty(downloadInfo.Ref, nameof(downloadInfo.ResolvedSha));
 
             string destDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), downloadInfo.NameWithOwner.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar), downloadInfo.Ref);
             string watermarkFile = GetWatermarkFilePath(destDirectory);
@@ -778,11 +780,6 @@ namespace GitHub.Runner.Worker
                 executionContext.Output($"Download action repository '{downloadInfo.NameWithOwner}@{downloadInfo.Ref}' (SHA:{downloadInfo.ResolvedSha})");
             }
 
-            await DownloadRepositoryActionAsync(executionContext, downloadInfo, destDirectory);
-        }
-
-        private async Task DownloadRepositoryActionAsync(IExecutionContext executionContext, WebApi.ActionDownloadInfo downloadInfo, string destDirectory)
-        {
             //download and extract action in a temp folder and rename it on success
             string tempDirectory = Path.Combine(HostContext.GetDirectory(WellKnownDirectory.Actions), "_temp_" + Guid.NewGuid());
             Directory.CreateDirectory(tempDirectory);
@@ -795,97 +792,47 @@ namespace GitHub.Runner.Worker
             string link = downloadInfo?.TarballUrl;
 #endif
 
-            Trace.Info($"Save archive '{link}' into {archiveFile}.");
             try
             {
-                int retryCount = 0;
-
-                // Allow up to 20 * 60s for any action to be downloaded from github graph.
-                int timeoutSeconds = 20 * 60;
-                while (retryCount < 3)
+                var useActionArchiveCache = false;
+                var actionArchiveCacheDir = Environment.GetEnvironmentVariable(Constants.Variables.Agent.ActionArchiveCacheDirectory);
+                if (!string.IsNullOrEmpty(actionArchiveCacheDir) &&
+                    Directory.Exists(actionArchiveCacheDir)
+                    // && executionContext.Global.Variables.GetBoolean("DistributedTask.UseActionArchiveCache") == true
+                    )
                 {
-                    using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
-                    using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                    Trace.Info($"Check if action archive '{downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha}' already exists in cache directory '{actionArchiveCacheDir}'");
+#if OS_WINDOWS
+                    var cacheArchiveFile = Path.Combine(actionArchiveCacheDir, downloadInfo.ResolvedNameWithOwner.Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_'), $"{downloadInfo.ResolvedSha}.zip");
+#else
+                    var cacheArchiveFile = Path.Combine(actionArchiveCacheDir, downloadInfo.ResolvedNameWithOwner.Replace(Path.DirectorySeparatorChar, '_').Replace(Path.AltDirectorySeparatorChar, '_'), $"{downloadInfo.ResolvedSha}.tar.gz");
+#endif
+                    if (File.Exists(cacheArchiveFile))
                     {
                         try
                         {
-                            //open zip stream in async mode
-                            using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
-                            using (var httpClientHandler = HostContext.CreateHttpClientHandler())
-                            using (var httpClient = new HttpClient(httpClientHandler))
-                            {
-                                httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(downloadInfo.Authentication?.Token);
-
-                                httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
-                                using (var response = await httpClient.GetAsync(link))
-                                {
-                                    var requestId = UrlUtil.GetGitHubRequestId(response.Headers);
-                                    if (!string.IsNullOrEmpty(requestId))
-                                    {
-                                        Trace.Info($"Request URL: {link} X-GitHub-Request-Id: {requestId} Http Status: {response.StatusCode}");
-                                    }
-
-                                    if (response.IsSuccessStatusCode)
-                                    {
-                                        using (var result = await response.Content.ReadAsStreamAsync())
-                                        {
-                                            await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
-                                            await fs.FlushAsync(actionDownloadCancellation.Token);
-
-                                            // download succeed, break out the retry loop.
-                                            break;
-                                        }
-                                    }
-                                    else if (response.StatusCode == HttpStatusCode.NotFound)
-                                    {
-                                        // It doesn't make sense to retry in this case, so just stop
-                                        throw new ActionNotFoundException(new Uri(link), requestId);
-                                    }
-                                    else
-                                    {
-                                        // Something else bad happened, let's go to our retry logic
-                                        response.EnsureSuccessStatusCode();
-                                    }
-                                }
-                            }
+                            Trace.Info($"Found action archive '{cacheArchiveFile}' in cache directory '{actionArchiveCacheDir}'");
+                            executionContext.Debug($"Copy action archive '{cacheArchiveFile}' to '{archiveFile}'");
+                            File.Copy(cacheArchiveFile, archiveFile);
+                            useActionArchiveCache = true;
                         }
-                        catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
+                        catch (Exception ex)
                         {
-                            Trace.Info("Action download has been cancelled.");
-                            throw;
+                            Trace.Error($"Failed to copy action archive '{cacheArchiveFile}' to '{archiveFile}'. Error: {ex}");
                         }
-                        catch (ActionNotFoundException)
-                        {
-                            Trace.Info($"The action at '{link}' does not exist");
-                            throw;
-                        }
-                        catch (Exception ex) when (retryCount < 2)
-                        {
-                            retryCount++;
-                            Trace.Error($"Fail to download archive '{link}' -- Attempt: {retryCount}");
-                            Trace.Error(ex);
-                            if (actionDownloadTimeout.Token.IsCancellationRequested)
-                            {
-                                // action download didn't finish within timeout
-                                executionContext.Warning($"Action '{link}' didn't finish download within {timeoutSeconds} seconds.");
-                            }
-                            else
-                            {
-                                executionContext.Warning($"Failed to download action '{link}'. Error: {ex.Message}");
-                            }
-                        }
-                    }
-
-                    if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
-                    {
-                        var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
-                        executionContext.Warning($"Back off {backOff.TotalSeconds} seconds before retry.");
-                        await Task.Delay(backOff);
                     }
                 }
 
-                ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
-                executionContext.Debug($"Download '{link}' to '{archiveFile}'");
+                executionContext.Global.JobTelemetry.Add(new JobTelemetry()
+                {
+                    Type = JobTelemetryType.General,
+                    Message = $"Action archive cache usage: {downloadInfo.ResolvedNameWithOwner}@{downloadInfo.ResolvedSha} use cache {useActionArchiveCache}"
+                });
+
+                if (!useActionArchiveCache)
+                {
+                    await DownloadRepositoryArchive(executionContext, link, downloadInfo.Authentication?.Token, archiveFile);
+                }
 
                 var stagingDirectory = Path.Combine(tempDirectory, "_staging");
                 Directory.CreateDirectory(stagingDirectory);
@@ -942,7 +889,6 @@ namespace GitHub.Runner.Worker
                 }
 
                 Trace.Verbose("Create watermark file indicate action download succeed.");
-                string watermarkFile = GetWatermarkFilePath(destDirectory);
                 File.WriteAllText(watermarkFile, DateTime.UtcNow.ToString());
 
                 executionContext.Debug($"Archive '{archiveFile}' has been unzipped into '{destDirectory}'.");
@@ -965,6 +911,99 @@ namespace GitHub.Runner.Worker
                     Trace.Warning("Failed to delete temp folder '{0}'. Exception: {1}", tempDirectory, ex);
                 }
             }
+        }
+
+        private async Task DownloadRepositoryArchive(IExecutionContext executionContext, string downloadUrl, string downloadAuthToken, string archiveFile)
+        {
+            Trace.Info($"Save archive '{downloadUrl}' into {archiveFile}.");
+            int retryCount = 0;
+
+            // Allow up to 20 * 60s for any action to be downloaded from github graph.
+            int timeoutSeconds = 20 * 60;
+            while (retryCount < 3)
+            {
+                using (var actionDownloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(timeoutSeconds)))
+                using (var actionDownloadCancellation = CancellationTokenSource.CreateLinkedTokenSource(actionDownloadTimeout.Token, executionContext.CancellationToken))
+                {
+                    try
+                    {
+                        //open zip stream in async mode
+                        using (FileStream fs = new(archiveFile, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: _defaultFileStreamBufferSize, useAsync: true))
+                        using (var httpClientHandler = HostContext.CreateHttpClientHandler())
+                        using (var httpClient = new HttpClient(httpClientHandler))
+                        {
+                            httpClient.DefaultRequestHeaders.Authorization = CreateAuthHeader(downloadAuthToken);
+
+                            httpClient.DefaultRequestHeaders.UserAgent.AddRange(HostContext.UserAgents);
+                            using (var response = await httpClient.GetAsync(downloadUrl))
+                            {
+                                var requestId = UrlUtil.GetGitHubRequestId(response.Headers);
+                                if (!string.IsNullOrEmpty(requestId))
+                                {
+                                    Trace.Info($"Request URL: {downloadUrl} X-GitHub-Request-Id: {requestId} Http Status: {response.StatusCode}");
+                                }
+
+                                if (response.IsSuccessStatusCode)
+                                {
+                                    using (var result = await response.Content.ReadAsStreamAsync())
+                                    {
+                                        await result.CopyToAsync(fs, _defaultCopyBufferSize, actionDownloadCancellation.Token);
+                                        await fs.FlushAsync(actionDownloadCancellation.Token);
+
+                                        // download succeed, break out the retry loop.
+                                        break;
+                                    }
+                                }
+                                else if (response.StatusCode == HttpStatusCode.NotFound)
+                                {
+                                    // It doesn't make sense to retry in this case, so just stop
+                                    throw new ActionNotFoundException(new Uri(downloadUrl), requestId);
+                                }
+                                else
+                                {
+                                    // Something else bad happened, let's go to our retry logic
+                                    response.EnsureSuccessStatusCode();
+                                }
+                            }
+                        }
+                    }
+                    catch (OperationCanceledException) when (executionContext.CancellationToken.IsCancellationRequested)
+                    {
+                        Trace.Info("Action download has been cancelled.");
+                        throw;
+                    }
+                    catch (ActionNotFoundException)
+                    {
+                        Trace.Info($"The action at '{downloadUrl}' does not exist");
+                        throw;
+                    }
+                    catch (Exception ex) when (retryCount < 2)
+                    {
+                        retryCount++;
+                        Trace.Error($"Fail to download archive '{downloadUrl}' -- Attempt: {retryCount}");
+                        Trace.Error(ex);
+                        if (actionDownloadTimeout.Token.IsCancellationRequested)
+                        {
+                            // action download didn't finish within timeout
+                            executionContext.Warning($"Action '{downloadUrl}' didn't finish download within {timeoutSeconds} seconds.");
+                        }
+                        else
+                        {
+                            executionContext.Warning($"Failed to download action '{downloadUrl}'. Error: {ex.Message}");
+                        }
+                    }
+                }
+
+                if (String.IsNullOrEmpty(Environment.GetEnvironmentVariable("_GITHUB_ACTION_DOWNLOAD_NO_BACKOFF")))
+                {
+                    var backOff = BackoffTimerHelper.GetRandomBackoff(TimeSpan.FromSeconds(10), TimeSpan.FromSeconds(30));
+                    executionContext.Warning($"Back off {backOff.TotalSeconds} seconds before retry.");
+                    await Task.Delay(backOff);
+                }
+            }
+
+            ArgUtil.NotNullOrEmpty(archiveFile, nameof(archiveFile));
+            executionContext.Debug($"Download '{downloadUrl}' to '{archiveFile}'");
         }
 
         private string GetWatermarkFilePath(string directory) => directory + ".completed";
